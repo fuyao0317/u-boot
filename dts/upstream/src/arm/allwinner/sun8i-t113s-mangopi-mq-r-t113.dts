@@ -21,6 +21,41 @@
 	cpu-supply = <&reg_vcc_core>;
 };
 
+&spi0 {
+	pinctrl-names = "default";
+	pinctrl-0 = <&spi0_pins>;
+	status = "okay";
+
+	spinand0: spinand@0 {
+		compatible = "spi-nand";
+		reg = <0>;
+		status = "okay";
+
+		partitions {
+			compatible = "fixed-partitions";
+			#address-cells = <1>;
+			#size-cells = <1>;
+
+			partition@0 {
+				label = "u-boot";
+				reg = <0x0 0x100000>;
+			};
+
+			partition@100000 {
+				label = "boot";
+				reg = <0x100000 0x1400000>;
+			};
+
+			partition@1500000 {
+				label = "system";
+				reg = <0x1500000 0xeb00000>;
+			};
+		};
+
+	};
+};
+
+
 &cpu1 {
 	cpu-supply = <&reg_vcc_core>;
 };
