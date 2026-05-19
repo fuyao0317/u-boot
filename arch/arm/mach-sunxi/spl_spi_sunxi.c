@@ -3,6 +3,7 @@
  * Copyright (C) 2016 Siarhei Siamashka <siarhei.siamashka@gmail.com>
  */
 
+#include <errno.h>
 #include <image.h>
 #include <log.h>
 #include <spl.h>
@@ -22,7 +23,7 @@
  * This is a very simple U-Boot image loading implementation, trying to
  * replicate what the boot ROM is doing when loading the SPL. Because we
  * know the exact pins where the SPI Flash is connected and also know
- * that the Read Data Bytes (03h) command is supported, the hardware
+ * that the SPI NAND read commands are supported, the hardware
  * configuration is very simple and we don't need the extra flexibility
  * of the SPI framework. Moreover, we rely on the default settings of
  * the SPI controler hardware registers and only adjust what needs to
@@ -35,6 +36,11 @@
  *
  * The pin mixing part is SoC specific and only A10/A13/A20/H3/A64 are
  * supported at the moment.
+ *
+ * This implementation supports Winbond W25N02 SPI NAND flash, using
+ * the Page Read to Cache (13h) + Read from Cache (03h) command pair.
+ * The on-chip ECC of the W25N02 is used (enabled by default after
+ * power-up).
  */
 
 /*****************************************************************************/
@@ -281,6 +287,21 @@ static void spi0_deinit(void)
 
 /*****************************************************************************/
 
+/* SPI NAND register addresses (Get/Set Feature) */
+#define SPINAND_REG_PROT		0xA0
+#define SPINAND_REG_CFG			0xB0
+#define SPINAND_REG_STATUS		0xC0
+
+#define SPINAND_STATUS_OIP		BIT(0)
+#define SPINAND_STATUS_ECC_MASK		GENMASK(5, 4)
+#define SPINAND_STATUS_ECC_UNCOR	(2 << 4)
+
+#define SPINAND_PAGE_SIZE		2048
+
+#define SPINAND_CMD_PAGE_READ		0x13
+#define SPINAND_CMD_READ_CACHE		0x03
+#define SPINAND_CMD_GET_FEATURE		0x0F
+
 #define SPI_READ_MAX_SIZE 60 /* FIFO size, minus 4 bytes of the header */
 
 static void sunxi_spi0_xfer(const u8 *txbuf, u32 txlen,
@@ -345,7 +366,31 @@ static void spi0_xfer(const u8 *txbuf, u32 txlen, u8 *rxbuf, u32 rxlen)
 	}
 }
 
-static void spi0_read_data(void *buf, u32 addr, u32 len, u32 addr_len)
+static u8 spi0_get_feature(u8 reg)
+{
+	u8 txbuf[2];
+	u8 val = 0;
+
+	txbuf[0] = SPINAND_CMD_GET_FEATURE;
+	txbuf[1] = reg;
+
+	spi0_xfer(txbuf, 2, &val, 1);
+
+	return val;
+}
+
+static u8 spi0_wait_for_ready(void)
+{
+	u8 status;
+
+	do {
+		status = spi0_get_feature(SPINAND_REG_STATUS);
+	} while (status & SPINAND_STATUS_OIP);
+
+	return status;
+}
+
+static void spi0_read_cache(void *buf, u32 col, u32 len)
 {
 	u8 *buf8 = buf;
 	u32 chunk_len;
@@ -353,37 +398,70 @@ static void spi0_read_data(void *buf, u32 addr, u32 len, u32 addr_len)
 
 	while (len > 0) {
 		chunk_len = len;
-
-		/* Configure the Read Data Bytes (03h) command header */
-		txbuf[0] = 0x03;
-		if (addr_len == 3) {
-			txbuf[1] = (u8)(addr >> 16);
-			txbuf[2] = (u8)(addr >> 8);
-			txbuf[3] = (u8)(addr);
-		} else if (addr_len == 2) {
-			txbuf[1] = (u8)(addr >> 8);
-			txbuf[2] = (u8)(addr);
-			txbuf[3] = 0; /* dummy */
-		}
-
 		if (chunk_len > SPI_READ_MAX_SIZE)
 			chunk_len = SPI_READ_MAX_SIZE;
 
+		txbuf[0] = SPINAND_CMD_READ_CACHE;
+		txbuf[1] = (u8)(col >> 8);
+		txbuf[2] = (u8)(col);
+		txbuf[3] = 0; /* dummy byte */
 		spi0_xfer(txbuf, 4, buf8, chunk_len);
 
-		/* tSHSL time is up to 100 ns in various SPI flash datasheets */
+		len  -= chunk_len;
+		buf8 += chunk_len;
+		col  += chunk_len;
+
+		/* tSHSL time */
 		udelay(1);
+	}
+
+}
+
+static int spi0_read_data(void *buf, u32 addr, u32 len)
+{
+	u8 *buf8 = buf;
+	u32 chunk_len;
+	u8 txbuf[4];
+	u32 page, col, offset_in_page;
+	u8 status;
+
+	while (len > 0) {
+		offset_in_page = addr % SPINAND_PAGE_SIZE;
+		page = addr / SPINAND_PAGE_SIZE;
+		col = offset_in_page;
+
+		chunk_len = SPINAND_PAGE_SIZE - offset_in_page;
+		if (chunk_len > len)
+			chunk_len = len;
+
+		/* Step 1: Page Read to Cache */
+		txbuf[0] = SPINAND_CMD_PAGE_READ;
+		txbuf[1] = (u8)(page >> 16);
+		txbuf[2] = (u8)(page >> 8);
+		txbuf[3] = (u8)(page);
+		spi0_xfer(txbuf, 4, NULL, 0);
+
+		/* Step 2: Wait for page read to complete */
+		status = spi0_wait_for_ready();
+		if ((status & SPINAND_STATUS_ECC_MASK) == SPINAND_STATUS_ECC_UNCOR)
+			return -EIO;
+
+		/* Step 3: Read from Cache */
+		spi0_read_cache(buf8, col, chunk_len);
 
 		len  -= chunk_len;
 		buf8 += chunk_len;
 		addr += chunk_len;
 	}
+
+	return 0;
 }
 
 static ulong spi_load_read(struct spl_load_info *load, ulong sector,
 			   ulong count, void *buf)
 {
-	spi0_read_data(buf, sector, count, 3);
+	if (spi0_read_data(buf, sector, count))
+		return 0;
 
 	return count;
 }
@@ -402,9 +480,11 @@ static int spl_spi_load_image(struct spl_image_info *spl_image,
 
 	spi0_init();
 
-	spi0_read_data((void *)header, load_offset, 0x40, 3);
+	ret = spi0_read_data((void *)header, load_offset, 0x40);
+	if (ret)
+		goto out;
 
-        if (IS_ENABLED(CONFIG_SPL_LOAD_FIT) &&
+	if (IS_ENABLED(CONFIG_SPL_LOAD_FIT) &&
 		image_get_magic(header) == FDT_MAGIC) {
 		struct spl_load_info load;
 
@@ -415,15 +495,16 @@ static int spl_spi_load_image(struct spl_image_info *spl_image,
 	} else {
 		ret = spl_parse_image_header(spl_image, bootdev, header);
 		if (ret)
-			return ret;
+			goto out;
 
-		spi0_read_data((void *)spl_image->load_addr,
-			       load_offset, spl_image->size, 3);
+		ret = spi0_read_data((void *)spl_image->load_addr,
+				     load_offset, spl_image->size);
 	}
 
+out:
 	spi0_deinit();
 
 	return ret;
 }
 /* Use priorty 0 to override the default if it happens to be linked in */
-SPL_LOAD_IMAGE_METHOD("sunxi SPI", 0, BOOT_DEVICE_SPI, spl_spi_load_image);
+SPL_LOAD_IMAGE_METHOD("sunxi SPI", 0, BOOT_DEVICE_NAND, spl_spi_load_image);
