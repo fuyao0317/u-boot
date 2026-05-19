@@ -202,6 +202,13 @@
 #define BOOT_TARGET_DEVICES_PXE(func)
 #endif
 
+#ifdef CONFIG_CMD_UBI
+#define BOOT_TARGET_DEVICES_UBI(func) func(UBI, ubi, na)
+#define BOOTENV_DEV_NAME_UBI(devtypeu, devtypel, instance) "ubi "
+#else
+#define BOOT_TARGET_DEVICES_UBI(func)
+#endif
+
 #ifdef CONFIG_CMD_DHCP
 #define BOOT_TARGET_DEVICES_DHCP(func) func(DHCP, dhcp, na)
 #else
@@ -215,6 +222,23 @@
 			"echo '(FEL boot)'; " \
 			"source ${fel_scriptaddr}; " \
 		"fi\0"
+
+#ifdef CONFIG_CMD_UBI
+#define BOOTENV_DEV_UBI(devtypeu, devtypel, instance) \
+	"bootcmd_ubi=" \
+		"echo Booting from UBI...; " \
+		"if ubi part ${ubi_mtd_part}; then " \
+			"if ubi read ${kernel_addr_r} ${ubi_vol_kernel}; then " \
+				"if ubi read ${fdt_addr_r} ${ubi_vol_dtb}; then " \
+					"setenv fdt_addr ${fdt_addr_r}; " \
+					"bootz ${kernel_addr_r} - ${fdt_addr_r}; " \
+				"fi; " \
+			"fi; " \
+		"fi\0"
+#else
+#define BOOTENV_DEV_UBI(devtypeu, devtypel, instance)
+#endif
+
 #define BOOTENV_DEV_NAME_FEL(devtypeu, devtypel, instance) \
 	"fel "
 
@@ -222,6 +246,7 @@
 	func(FEL, fel, na) \
 	BOOT_TARGET_DEVICES_MMC(func) \
 	BOOT_TARGET_DEVICES_SCSI(func) \
+	BOOT_TARGET_DEVICES_UBI(func) \
 	BOOT_TARGET_DEVICES_USB(func) \
 	BOOT_TARGET_DEVICES_PXE(func) \
 	BOOT_TARGET_DEVICES_DHCP(func)
@@ -296,6 +321,9 @@
 	"uuid_gpt_esp=" UUID_GPT_ESP "\0" \
 	"uuid_gpt_system=" UUID_GPT_SYSTEM "\0" \
 	"partitions=" PARTS_DEFAULT "\0" \
+	"ubi_mtd_part=boot\0" \
+	"ubi_vol_kernel=kernel\0" \
+	"ubi_vol_dtb=dtb\0" \
 	BOOTCMD_SUNXI_COMPAT \
 	BOOTENV
 
