@@ -595,6 +595,7 @@ static int spl_load_image(struct spl_image_info *spl_image,
 	bootdev.boot_device = loader->boot_device;
 	bootdev.boot_device_name = NULL;
 
+	printf("Loading image from %s\n", spl_loader_name(loader));
 	ret = loader->load_image(spl_image, &bootdev);
 #ifdef CONFIG_SPL_LEGACY_IMAGE_CRC_CHECK
 	if (!ret && spl_image->dcrc_length) {
@@ -647,6 +648,7 @@ static int boot_from_devices(struct spl_image_info *spl_image,
 				       spl_loader_name(loader));
 			}
 
+			printf("Try to load image\n");
 			ret = spl_load_image(spl_image, loader);
 			if (!ret) {
 				spl_image->boot_device = bootdev;
