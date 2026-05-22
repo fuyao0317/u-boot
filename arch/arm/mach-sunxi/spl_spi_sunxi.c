@@ -107,6 +107,14 @@
 #define SPI0_CLK_DIV_BY_4           0x1001
 #define SPI0_CLK_DIV_BY_32          0x100f
 
+/*
+ * NCAT2 SPI0 module clock from PLL_PERIPH0 (600MHz).
+ * Register 0x940: bit31=gate, bits[26:24]=src(1=PLL_PERIPH0),
+ * bits[9:8]=N(2^N), bits[3:0]=M(M+1).
+ * 600MHz / 1 / 8 = 75MHz.
+ */
+#define SPI0_CLK_SRC_PERIPH0_75M    ((1 << 31) | (1 << 24) | 7)
+
 /*****************************************************************************/
 
 /*
@@ -200,8 +208,13 @@ static void spi0_enable_clock(void)
 			       SUN4I_SPI0_CCTL));
 		}
 
-		/* 24MHz from OSC24M */
-		writel((1 << 31), CCM_SPI0_CLK);
+		if (IS_ENABLED(CONFIG_SUNXI_GEN_NCAT2)) {
+			/* 75MHz from PLL_PERIPH0 (600MHz / 8) */
+			writel(SPI0_CLK_SRC_PERIPH0_75M, CCM_SPI0_CLK);
+		} else {
+			/* 24MHz from OSC24M */
+			writel((1 << 31), CCM_SPI0_CLK);
+		}
 	}
 
 	if (is_sun6i_gen_spi()) {
@@ -297,6 +310,8 @@ static void spi0_deinit(void)
 #define SPINAND_STATUS_ECC_UNCOR	(2 << 4)
 
 #define SPINAND_PAGE_SIZE		2048
+#define SPINAND_PAGES_PER_BLOCK		64
+#define SPINAND_BLOCK_SIZE		(SPINAND_PAGE_SIZE * SPINAND_PAGES_PER_BLOCK)
 
 #define SPINAND_CMD_PAGE_READ		0x13
 #define SPINAND_CMD_READ_CACHE		0x03
@@ -417,15 +432,46 @@ static void spi0_read_cache(void *buf, u32 col, u32 len)
 
 }
 
+static bool spi0_is_badblock(u32 block)
+{
+	u32 page = block * SPINAND_PAGES_PER_BLOCK;
+	u8 marker = 0;
+	u8 txbuf[4];
+
+	/* Page Read to Cache: load the first page of the block */
+	txbuf[0] = SPINAND_CMD_PAGE_READ;
+	txbuf[1] = (u8)(page >> 16);
+	txbuf[2] = (u8)(page >> 8);
+	txbuf[3] = (u8)(page);
+	spi0_xfer(txbuf, 4, NULL, 0);
+
+	spi0_wait_for_ready();
+
+	/* Read first byte of OOB area (column = page size) */
+	spi0_read_cache(&marker, SPINAND_PAGE_SIZE, 1);
+
+	return marker != 0xFF;
+}
+
 static int spi0_read_data(void *buf, u32 addr, u32 len)
 {
 	u8 *buf8 = buf;
 	u32 chunk_len;
 	u8 txbuf[4];
 	u32 page, col, offset_in_page;
+	u32 block, offset_in_block;
 	u8 status;
 
 	while (len > 0) {
+		block = addr / SPINAND_BLOCK_SIZE;
+		offset_in_block = addr % SPINAND_BLOCK_SIZE;
+
+		/* Skip bad blocks */
+		if (spi0_is_badblock(block)) {
+			addr += SPINAND_BLOCK_SIZE - offset_in_block;
+			continue;
+		}
+
 		offset_in_page = addr % SPINAND_PAGE_SIZE;
 		page = addr / SPINAND_PAGE_SIZE;
 		col = offset_in_page;
