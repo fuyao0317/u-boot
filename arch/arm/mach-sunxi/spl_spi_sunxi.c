@@ -315,6 +315,7 @@ static void spi0_deinit(void)
 
 #define SPINAND_CMD_PAGE_READ		0x13
 #define SPINAND_CMD_READ_CACHE		0x03
+#define SPINAND_CMD_READ_CACHE_FAST	0x0B
 #define SPINAND_CMD_GET_FEATURE		0x0F
 
 #define SPI_READ_MAX_SIZE 60 /* FIFO size, minus 4 bytes of the header */
@@ -416,7 +417,7 @@ static void spi0_read_cache(void *buf, u32 col, u32 len)
 		if (chunk_len > SPI_READ_MAX_SIZE)
 			chunk_len = SPI_READ_MAX_SIZE;
 
-		txbuf[0] = SPINAND_CMD_READ_CACHE;
+		txbuf[0] = SPINAND_CMD_READ_CACHE_FAST;
 		txbuf[1] = (u8)(col >> 8);
 		txbuf[2] = (u8)(col);
 		txbuf[3] = 0; /* dummy byte */
@@ -425,9 +426,6 @@ static void spi0_read_cache(void *buf, u32 col, u32 len)
 		len  -= chunk_len;
 		buf8 += chunk_len;
 		col  += chunk_len;
-
-		/* tSHSL time */
-		udelay(1);
 	}
 
 }
@@ -460,16 +458,20 @@ static int spi0_read_data(void *buf, u32 addr, u32 len)
 	u8 txbuf[4];
 	u32 page, col, offset_in_page;
 	u32 block, offset_in_block;
+	u32 last_good_block = ~0U;
 	u8 status;
 
 	while (len > 0) {
 		block = addr / SPINAND_BLOCK_SIZE;
 		offset_in_block = addr % SPINAND_BLOCK_SIZE;
 
-		/* Skip bad blocks */
-		if (spi0_is_badblock(block)) {
-			addr += SPINAND_BLOCK_SIZE - offset_in_block;
-			continue;
+		/* Only check bad block once per block boundary */
+		if (block != last_good_block) {
+			if (spi0_is_badblock(block)) {
+				addr += SPINAND_BLOCK_SIZE - offset_in_block;
+				continue;
+			}
+			last_good_block = block;
 		}
 
 		offset_in_page = addr % SPINAND_PAGE_SIZE;
