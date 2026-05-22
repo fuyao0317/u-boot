@@ -312,6 +312,7 @@ static void spi0_deinit(void)
 #define SPINAND_PAGE_SIZE		2048
 #define SPINAND_PAGES_PER_BLOCK		64
 #define SPINAND_BLOCK_SIZE		(SPINAND_PAGE_SIZE * SPINAND_PAGES_PER_BLOCK)
+#define SPINAND_MAX_BLOCK_SCAN		4096
 
 #define SPINAND_CMD_PAGE_READ		0x13
 #define SPINAND_CMD_READ_CACHE		0x03
@@ -433,7 +434,7 @@ static void spi0_read_cache(void *buf, u32 col, u32 len)
 static bool spi0_is_badblock(u32 block)
 {
 	u32 page = block * SPINAND_PAGES_PER_BLOCK;
-	u8 marker = 0;
+	u8 marker[2] = { };
 	u8 txbuf[4];
 
 	/* Page Read to Cache: load the first page of the block */
@@ -445,13 +446,38 @@ static bool spi0_is_badblock(u32 block)
 
 	spi0_wait_for_ready();
 
-	/* Read first byte of OOB area (column = page size) */
-	spi0_read_cache(&marker, SPINAND_PAGE_SIZE, 1);
+	/* Read the bad block marker bytes from the OOB area. */
+	spi0_read_cache(marker, SPINAND_PAGE_SIZE, sizeof(marker));
 
-	return marker != 0xFF;
+	return marker[0] != 0xFF || marker[1] != 0xFF;
 }
 
-static int spi0_read_data(void *buf, u32 addr, u32 len)
+static int spi0_logical_to_physical(u32 base, u32 addr, u32 *phys)
+{
+	u32 block = base / SPINAND_BLOCK_SIZE;
+	u32 offset_in_block = base % SPINAND_BLOCK_SIZE;
+	u32 logical = addr - base;
+
+	for (; block < SPINAND_MAX_BLOCK_SCAN; block++) {
+		if (spi0_is_badblock(block))
+			goto next_block;
+
+		if (logical < SPINAND_BLOCK_SIZE - offset_in_block) {
+			*phys = block * SPINAND_BLOCK_SIZE;
+			*phys += offset_in_block + logical;
+			return 0;
+		}
+
+		logical -= SPINAND_BLOCK_SIZE - offset_in_block;
+
+next_block:
+		offset_in_block = 0;
+	}
+
+	return -EIO;
+}
+
+static int spi0_read_data(void *buf, u32 base, u32 addr, u32 len)
 {
 	u8 *buf8 = buf;
 	u32 chunk_len;
@@ -459,23 +485,36 @@ static int spi0_read_data(void *buf, u32 addr, u32 len)
 	u32 page, col, offset_in_page;
 	u32 block, offset_in_block;
 	u32 last_good_block = ~0U;
+	u32 phys;
 	u8 status;
+	int ret;
+
+	if (addr < base)
+		return -EINVAL;
+
+	ret = spi0_logical_to_physical(base, addr, &phys);
+	if (ret)
+		return ret;
 
 	while (len > 0) {
-		block = addr / SPINAND_BLOCK_SIZE;
-		offset_in_block = addr % SPINAND_BLOCK_SIZE;
+		block = phys / SPINAND_BLOCK_SIZE;
+		offset_in_block = phys % SPINAND_BLOCK_SIZE;
 
-		/* Only check bad block once per block boundary */
 		if (block != last_good_block) {
+			if (block >= SPINAND_MAX_BLOCK_SCAN)
+				return -EIO;
+
 			if (spi0_is_badblock(block)) {
-				addr += SPINAND_BLOCK_SIZE - offset_in_block;
+				if (block >= SPINAND_MAX_BLOCK_SCAN - 1)
+					return -EIO;
+				phys += SPINAND_BLOCK_SIZE - offset_in_block;
 				continue;
 			}
 			last_good_block = block;
 		}
 
-		offset_in_page = addr % SPINAND_PAGE_SIZE;
-		page = addr / SPINAND_PAGE_SIZE;
+		offset_in_page = phys % SPINAND_PAGE_SIZE;
+		page = phys / SPINAND_PAGE_SIZE;
 		col = offset_in_page;
 
 		chunk_len = SPINAND_PAGE_SIZE - offset_in_page;
@@ -499,7 +538,7 @@ static int spi0_read_data(void *buf, u32 addr, u32 len)
 
 		len  -= chunk_len;
 		buf8 += chunk_len;
-		addr += chunk_len;
+		phys += chunk_len;
 	}
 
 	return 0;
@@ -508,7 +547,9 @@ static int spi0_read_data(void *buf, u32 addr, u32 len)
 static ulong spi_load_read(struct spl_load_info *load, ulong sector,
 			   ulong count, void *buf)
 {
-	if (spi0_read_data(buf, sector, count))
+	u32 base = *(u32 *)load->priv;
+
+	if (spi0_read_data(buf, base, sector, count))
 		return 0;
 
 	return count;
@@ -528,7 +569,7 @@ static int spl_spi_load_image(struct spl_image_info *spl_image,
 
 	spi0_init();
 
-	ret = spi0_read_data((void *)header, load_offset, 0x40);
+	ret = spi0_read_data((void *)header, load_offset, load_offset, 0x40);
 	if (ret)
 		goto out;
 
@@ -537,7 +578,7 @@ static int spl_spi_load_image(struct spl_image_info *spl_image,
 		struct spl_load_info load;
 
 		debug("Found FIT image\n");
-		spl_load_init(&load, spi_load_read, NULL, 1);
+		spl_load_init(&load, spi_load_read, &load_offset, 1);
 		ret = spl_load_simple_fit(spl_image, &load,
 					  load_offset, header);
 	} else {
@@ -546,7 +587,8 @@ static int spl_spi_load_image(struct spl_image_info *spl_image,
 			goto out;
 
 		ret = spi0_read_data((void *)spl_image->load_addr,
-				     load_offset, spl_image->size);
+				     load_offset, load_offset,
+				     spl_image->size);
 	}
 
 out:
